@@ -1,0 +1,8 @@
+**.zip
+**node_modules**
+**node**
+**target**
+**jobs**
+**.make-logs**
+**.DS_Store**
+**.yarn**

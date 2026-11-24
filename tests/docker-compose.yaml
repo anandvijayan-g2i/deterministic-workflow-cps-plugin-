@@ -1,0 +1,7 @@
+services:
+  main:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    command: ["sh", "-c", "sleep infinity"]

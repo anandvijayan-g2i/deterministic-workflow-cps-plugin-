@@ -1,0 +1,48 @@
+
+{
+  "tests": [
+    {
+      "id": "cps_step_context_test",
+      "checks": "CPS StepContext behavior must remain compatible with the replay step.",
+      "tier": "must",
+      "implicit": true,
+      "evidence": "Preserve existing CPS step-context execution because replay must work with normal Pipeline steps."
+    },
+    {
+      "id": "parallel_step_test",
+      "checks": "Parallel Step behavior must remain compatible with deterministic replay.",
+      "tier": "must",
+      "implicit": true,
+      "evidence": "Preserve existing Parallel Step behavior while replay executes and validates block steps."
+    },
+    {
+      "id": "cps_body_execution_test",
+      "checks": "CPS body execution must remain compatible with replay blocks.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "Preserve existing CPS body execution while replay and verification run a block."
+    },
+    {
+      "id": "deterministic_replay_record_test",
+      "checks": "Record mode must execute the body and save steps and outcomes for later verification.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "In record mode, execute the body and save the steps and outcomes for later verification."
+    },
+    {
+      "id": "deterministic_replay_verify_test",
+      "checks": "Verify mode must replay outcomes without repeating side effects and select the correct baseline.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "In verify mode, replay recorded outcomes without repeating side effects and execute passthrough steps normally."
+    },
+    {
+      "id": "determinism_drift_test",
+      "checks": "Determinism drift must abort the build and prevent mismatched or later steps from running.",
+      "tier": "must",
+      "implicit": true,
+      "evidence": "Abort the build on drift, extra or missing steps, or mismatched arguments or step names."
+    }
+  ],
+  "rubrics": []
+}

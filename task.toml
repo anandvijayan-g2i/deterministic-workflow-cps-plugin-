@@ -1,0 +1,53 @@
+schema_version = "1.3"
+artifacts = ["/app/plugin/src/main"]
+
+[task]
+name = "phoenix-devops/workflow-cps-deterministic-replay"
+authors = [{ name = "Andy" }]
+description = "Implement a deterministic execution recording and replay verification engine (deterministicReplay step) inside jenkinsci/workflow-cps-plugin."
+keywords = ["java", "jenkins", "pipeline", "groovy-cps", "determinism", "record-replay", "concurrency", "durability"]
+
+[metadata]
+category = "software-engineering"
+difficulty = "hard"
+difficulty_explanation = "Requires hooking step start/completion in the CPS engine, persisting tape outcomes, and aborting builds on drift."
+repo = "jenkinsci/workflow-cps-plugin"
+language = "java"
+fail_to_pass = [
+  "org.jenkinsci.plugins.workflow.cps.determinism.DeterministicReplayRecordTest",
+  "org.jenkinsci.plugins.workflow.cps.determinism.DeterministicReplayVerifyTest",
+  "org.jenkinsci.plugins.workflow.cps.determinism.DeterminismDriftTest",
+]
+pass_to_pass = [
+  "org.jenkinsci.plugins.workflow.cps.CpsStepContextTest",
+  "org.jenkinsci.plugins.workflow.cps.steps.ParallelStepTest",
+  "org.jenkinsci.plugins.workflow.cps.CpsBodyExecutionTest",
+]
+
+[verifier]
+timeout_sec = 3600.0
+user = "root"
+environment_mode = "separate"
+network_mode = "allowlist"
+allowed_hosts = []
+
+[agent]
+timeout_sec = 3600.0
+network_mode = "allowlist"
+allowed_hosts = []
+
+[environment]
+# Allow image preparation to download Maven dependencies; runtime phases use an empty allowlist.
+network_mode = "public"
+build_timeout_sec = 3600
+workdir = "/app"
+cpus = 4
+memory_mb = 9216
+storage_mb = 20480
+
+[verifier.environment]
+network_mode = "public"
+build_timeout_sec = 3600
+cpus = 4
+memory_mb = 9216
+storage_mb = 20480

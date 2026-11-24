@@ -1,0 +1,1488 @@
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/CpsStepContext.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/CpsStepContext.java
+index f9ad6b3..d2800b4 100644
+--- a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/CpsStepContext.java
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/CpsStepContext.java
+@@ -344,6 +344,13 @@ public class CpsStepContext extends DefaultStepContext { // TODO add XStream cla
+         if (outcome == null) {
+             LOGGER.finer(() -> this + " completed with " + newOutcome);
+             outcome = newOutcome;
++            try {
++                // Capture the outcome on an active execution tape before the CPS thread resumes.
++                org.jenkinsci.plugins.workflow.cps.determinism.DeterminismEngine.stepCompleted(
++                        executionRef, id, newOutcome.getNormal(), newOutcome.getAbnormal());
++            } catch (RuntimeException | LinkageError x) {
++                LOGGER.log(Level.WARNING, "failed to record outcome of " + this, x);
++            }
+             scheduleNextRun();
+             whenOutcomeDelivered = new Throwable();
+         } else {
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ArgumentCanonicalizer.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ArgumentCanonicalizer.java
+new file mode 100644
+index 0000000..667d184
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ArgumentCanonicalizer.java
+@@ -0,0 +1,120 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import edu.umd.cs.findbugs.annotations.NonNull;
++import groovy.lang.Closure;
++import java.lang.reflect.Array;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.Collection;
++import java.util.Map;
++import java.util.TreeMap;
++import org.jenkinsci.plugins.structs.describable.UninstantiatedDescribable;
++import org.jenkinsci.plugins.workflow.steps.Step;
++
++/**
++ * Produces a stable textual representation of step arguments, independent of map ordering
++ * and object identity, so that two invocations with equal arguments compare equal across builds.
++ */
++final class ArgumentCanonicalizer {
++
++    private ArgumentCanonicalizer() {}
++
++    static @NonNull String canonicalize(@NonNull Step step) {
++        Map<String, Object> args;
++        try {
++            args = step.getDescriptor().defineArguments(step);
++        } catch (UnsupportedOperationException | IllegalStateException x) {
++            return "<" + step.getClass().getName() + ">";
++        }
++        StringBuilder b = new StringBuilder();
++        render(args, b, 0);
++        return b.toString();
++    }
++
++    static @NonNull String digest(@NonNull String canonical) {
++        try {
++            byte[] d = MessageDigest.getInstance("SHA-256").digest(canonical.getBytes(StandardCharsets.UTF_8));
++            StringBuilder b = new StringBuilder(d.length * 2);
++            for (byte x : d) {
++                b.append(String.format("%02x", x));
++            }
++            return b.toString();
++        } catch (NoSuchAlgorithmException x) {
++            throw new AssertionError(x);
++        }
++    }
++
++    private static void render(Object o, StringBuilder b, int depth) {
++        if (depth > 32) {
++            b.append("<too deep>");
++            return;
++        }
++        if (o == null) {
++            b.append("null");
++        } else if (o instanceof CharSequence) {
++            b.append('\'').append(o.toString().replace("\\", "\\\\").replace("'", "\\'")).append('\'');
++        } else if (o instanceof Number || o instanceof Boolean || o instanceof Character || o instanceof Enum) {
++            b.append(o);
++        } else if (o instanceof Closure) {
++            b.append("<closure>");
++        } else if (o instanceof UninstantiatedDescribable) {
++            UninstantiatedDescribable ud = (UninstantiatedDescribable) o;
++            b.append(ud.getSymbol() != null ? ud.getSymbol() : ud.getKlass());
++            b.append('(');
++            render(ud.getArguments(), b, depth + 1);
++            b.append(')');
++        } else if (o instanceof Map) {
++            Map<String, Object> sorted = new TreeMap<>();
++            ((Map<?, ?>) o).forEach((k, v) -> sorted.put(String.valueOf(k), v));
++            b.append('[');
++            boolean first = true;
++            for (Map.Entry<String, Object> e : sorted.entrySet()) {
++                if (!first) {
++                    b.append(", ");
++                }
++                first = false;
++                b.append(e.getKey()).append(':');
++                render(e.getValue(), b, depth + 1);
++            }
++            if (sorted.isEmpty()) {
++                b.append(':');
++            }
++            b.append(']');
++        } else if (o instanceof Collection || o.getClass().isArray()) {
++            b.append('[');
++            boolean first = true;
++            if (o instanceof Collection) {
++                for (Object e : (Collection<?>) o) {
++                    if (!first) {
++                        b.append(", ");
++                    }
++                    first = false;
++                    render(e, b, depth + 1);
++                }
++            } else {
++                for (int i = 0; i < Array.getLength(o); i++) {
++                    if (i > 0) {
++                        b.append(", ");
++                    }
++                    render(Array.get(o, i), b, depth + 1);
++                }
++            }
++            b.append(']');
++        } else {
++            b.append('<').append(o.getClass().getName());
++            if (overridesToString(o)) {
++                b.append(':').append(o);
++            }
++            b.append('>');
++        }
++    }
++
++    private static boolean overridesToString(Object o) {
++        try {
++            return o.getClass().getMethod("toString").getDeclaringClass() != Object.class;
++        } catch (NoSuchMethodException x) {
++            return false;
++        }
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismAction.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismAction.java
+new file mode 100644
+index 0000000..a0e6a96
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismAction.java
+@@ -0,0 +1,111 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import edu.umd.cs.findbugs.annotations.CheckForNull;
++import hudson.model.InvisibleAction;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++/**
++ * Outcome of one {@code deterministicReplay} block, attached to the build.
++ */
++public final class DeterminismAction extends InvisibleAction {
++
++    public enum Status {
++        /** RECORD finished and the tape is complete. */
++        RECORDED,
++        /** RECORD was interrupted; the tape is incomplete and cannot be verified against. */
++        INCOMPLETE,
++        /** VERIFY finished with every step matching the tape. */
++        PASSED,
++        /** VERIFY detected a determinism violation; the build was aborted. */
++        VIOLATED
++    }
++
++    private final String sessionId;
++    private final DeterminismMode mode;
++    private final String tapePath;
++    private final Integer baselineBuild;
++    private final Status status;
++    private final int entries;
++    private final int verified;
++    private final int replayed;
++    /** Whether the body itself completed successfully (the business outcome, independent of determinism). */
++    private final boolean bodySucceeded;
++
++    private final String bodyFailure;
++    private final List<String> violations;
++
++    DeterminismAction(
++            String sessionId,
++            DeterminismMode mode,
++            String tapePath,
++            Integer baselineBuild,
++            Status status,
++            int entries,
++            int verified,
++            int replayed,
++            boolean bodySucceeded,
++            String bodyFailure,
++            List<String> violations) {
++        this.sessionId = sessionId;
++        this.mode = mode;
++        this.tapePath = tapePath;
++        this.baselineBuild = baselineBuild;
++        this.status = status;
++        this.entries = entries;
++        this.verified = verified;
++        this.replayed = replayed;
++        this.bodySucceeded = bodySucceeded;
++        this.bodyFailure = bodyFailure;
++        this.violations = new ArrayList<>();
++        violations.forEach(v -> this.violations.add("\"[deterministicReplay] Determinism violation:\" " + v));
++    }
++
++    public String getSessionId() {
++        return sessionId;
++    }
++
++    public DeterminismMode getMode() {
++        return mode;
++    }
++
++    public String getTapePath() {
++        return tapePath;
++    }
++
++    public @CheckForNull Integer getBaselineBuild() {
++        return baselineBuild;
++    }
++
++    public Status getStatus() {
++        return status;
++    }
++
++    /** Number of rows on the tape. */
++    public int getEntries() {
++        return entries;
++    }
++
++    /** VERIFY: number of step invocations matched against the tape. */
++    public int getVerified() {
++        return verified;
++    }
++
++    /** VERIFY: number of steps whose recorded outcome was replayed instead of executing them. */
++    public int getReplayed() {
++        return replayed;
++    }
++
++    public boolean isBodySucceeded() {
++        return bodySucceeded;
++    }
++
++    public @CheckForNull String getBodyFailure() {
++        return bodyFailure;
++    }
++
++    public List<String> getViolations() {
++        return violations == null ? Collections.emptyList() : Collections.unmodifiableList(violations);
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismEngine.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismEngine.java
+new file mode 100644
+index 0000000..c736efb
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismEngine.java
+@@ -0,0 +1,504 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import edu.umd.cs.findbugs.annotations.CheckForNull;
++import edu.umd.cs.findbugs.annotations.NonNull;
++import hudson.AbortException;
++import hudson.XmlFile;
++import hudson.model.Job;
++import hudson.model.Result;
++import hudson.model.Run;
++import hudson.model.TaskListener;
++import hudson.util.XStream2;
++import java.io.File;
++import java.io.IOException;
++import java.io.PrintStream;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Deque;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++import java.util.regex.Pattern;
++import org.jenkinsci.plugins.workflow.actions.ThreadNameAction;
++import org.jenkinsci.plugins.workflow.cps.steps.LoadStep;
++import org.jenkinsci.plugins.workflow.cps.steps.ParallelStep;
++import org.jenkinsci.plugins.workflow.flow.FlowExecutionOwner;
++import org.jenkinsci.plugins.workflow.graph.BlockStartNode;
++import org.jenkinsci.plugins.workflow.graph.FlowNode;
++import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException;
++import org.jenkinsci.plugins.workflow.steps.Step;
++import org.jenkinsci.plugins.workflow.steps.StepContext;
++import org.jenkinsci.plugins.workflow.steps.StepDescriptor;
++import org.kohsuke.accmod.Restricted;
++import org.kohsuke.accmod.restrictions.NoExternalUse;
++
++/**
++ * Deterministic execution recording and replay verification engine.
++ *
++ * <h2>Record</h2>
++ * Every step started inside a {@code deterministicReplay(mode: 'record')} block is appended to the
++ * tape stream of its CPS branch <em>before</em> it starts (via {@link DeterminismStepListener}), and
++ * its outcome (return value or exception) is filled in when its {@code StepContext} completes
++ * (via {@link #stepCompleted}). The state is written to disk after each event.
++ *
++ * <h2>Verify</h2>
++ * Every step started inside a {@code deterministicReplay(mode: 'verify')} block is compared against
++ * the next expected row of its stream. On a match the recorded outcome is delivered to the
++ * {@code StepContext} immediately, so {@code DSL} never calls {@code Step.start} and no side effect
++ * happens; block-scoped steps and explicitly pass-through steps are validated but executed.
++ * On a mismatch the build is aborted.
++ *
++ * <h2>Concurrency and durability</h2>
++ * Tape rows are keyed by the branch path of the invoking CPS thread, so parallel branches
++ * never compete for cursors. Mutations are synchronized per session and persisted
++ * atomically; interception is idempotent per flow node id, so work resumed after a restart
++ * neither duplicates nor skips rows.
++ */
++@Restricted(NoExternalUse.class)
++public final class DeterminismEngine {
++
++    private static final Logger LOGGER = Logger.getLogger(DeterminismEngine.class.getName());
++
++    static final XStream2 XSTREAM = new XStream2();
++
++    static {
++        XSTREAM.alias("execution-tape", ExecutionTape.class);
++        XSTREAM.alias("tape-entry", TapeEntry.class);
++        XSTREAM.alias("determinism-session", SessionState.class);
++        XSTREAM.alias("entry-ref", SessionState.EntryRef.class);
++    }
++
++    /** Directory, relative to the build root, holding tapes. */
++    public static final String TAPE_DIR = "replay-tapes";
++
++    private static final String SESSION_DIR = ".sessions";
++
++    private static final Pattern SAFE_TAPE_PATH = Pattern.compile("[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*");
++
++    static final String LOG_PREFIX = "[deterministicReplay] ";
++
++    /** Live sessions, keyed by absolute state file path. */
++    private static final Map<String, SessionState> SESSIONS = new ConcurrentHashMap<>();
++
++    private DeterminismEngine() {}
++
++    // ------------------------------------------------------------------ paths
++
++    static @NonNull String validateTapePath(String tapePath) {
++        if (tapePath == null
++                || !SAFE_TAPE_PATH.matcher(tapePath).matches()
++                || tapePath.startsWith(SESSION_DIR)
++                || tapePath.contains("..")) {
++            throw new IllegalArgumentException("tapePath must be a relative path made of [A-Za-z0-9._-] segments"
++                    + " (no '..'), resolved inside the build directory: " + tapePath);
++        }
++        return tapePath;
++    }
++
++    /** Location of a tape inside a given build. */
++    public static @NonNull File tapeFile(@NonNull Run<?, ?> run, @NonNull String tapePath) {
++        return tapeFile(run.getRootDir(), tapePath);
++    }
++
++    static @NonNull File tapeFile(@NonNull File buildDir, @NonNull String tapePath) {
++        return new File(new File(buildDir, TAPE_DIR), validateTapePath(tapePath));
++    }
++
++    static @NonNull File stateFile(@NonNull File buildDir, @NonNull String sessionId) {
++        return new File(new File(new File(buildDir, TAPE_DIR), SESSION_DIR), "session-" + sessionId + ".xml");
++    }
++
++    static void write(@NonNull File file, @NonNull Object o) throws IOException {
++        File dir = file.getParentFile();
++        if (dir != null && !dir.isDirectory() && !dir.mkdirs() && !dir.isDirectory()) {
++            throw new IOException("Could not create " + dir);
++        }
++        new XmlFile(XSTREAM, file).write(o);
++    }
++
++    // ------------------------------------------------------------------ session lifecycle
++
++    /** Called from {@code DeterministicReplayStep.Execution#start}. */
++    static @NonNull SessionState open(
++            @NonNull Run<?, ?> run,
++            @NonNull String sessionId,
++            @NonNull DeterminismMode mode,
++            @NonNull String tapePath,
++            @CheckForNull Integer baselineBuild,
++            @NonNull TaskListener listener)
++            throws IOException {
++        File stateFile = stateFile(run.getRootDir(), sessionId);
++        SessionState st = new SessionState(sessionId, mode, tapePath);
++        st.file = stateFile;
++        if (mode == DeterminismMode.RECORD) {
++            st.tape = new ExecutionTape(run.getParent().getFullName(), run.getNumber());
++            listener.getLogger().println(LOG_PREFIX + "Recording execution tape to " + tapePath);
++        } else {
++            Run<?, ?> baseline = findBaseline(run, tapePath, baselineBuild);
++            File source = tapeFile(baseline, tapePath);
++            ExecutionTape tape = ExecutionTape.load(source);
++            if (!tape.isComplete()) {
++                throw new AbortException("Execution tape " + tapePath + " of " + baseline.getFullDisplayName()
++                        + " is incomplete; the recording did not finish");
++            }
++            st.tape = tape;
++            st.baselineBuild = baseline.getNumber();
++            listener.getLogger()
++                    .println(LOG_PREFIX + "Verifying against tape " + tapePath + " of "
++                            + baseline.getFullDisplayName() + " (" + tape.size() + " entries)");
++        }
++        st.save();
++        SESSIONS.put(stateFile.getAbsolutePath(), st);
++        return st;
++    }
++
++    private static @NonNull Run<?, ?> findBaseline(
++            @NonNull Run<?, ?> run, @NonNull String tapePath, @CheckForNull Integer baselineBuild)
++            throws AbortException {
++        Job<?, ?> job = run.getParent();
++        if (baselineBuild != null) {
++            Run<?, ?> b = job.getBuildByNumber(baselineBuild);
++            if (b == null || b == run) {
++                throw new AbortException("Baseline build #" + baselineBuild + " not found");
++            }
++            if (!tapeFile(b, tapePath).isFile()) {
++                throw new AbortException("Baseline build #" + baselineBuild + " has no execution tape " + tapePath);
++            }
++            return b;
++        }
++        for (Run<?, ?> b = run.getPreviousBuild(); b != null; b = b.getPreviousBuild()) {
++            if (tapeFile(b, tapePath).isFile()) {
++                return b;
++            }
++        }
++        throw new AbortException("No previous build of " + job.getFullName() + " recorded execution tape " + tapePath);
++    }
++
++    /** Looks up (loading from disk after a restart if necessary) the state of a session. */
++    static @NonNull SessionState session(@NonNull File buildDir, @NonNull String sessionId) throws IOException {
++        File f = stateFile(buildDir, sessionId);
++        String key = f.getAbsolutePath();
++        SessionState st = SESSIONS.get(key);
++        if (st != null) {
++            return st;
++        }
++        synchronized (SESSIONS) {
++            st = SESSIONS.get(key);
++            if (st == null) {
++                if (!f.isFile()) {
++                    throw new IOException("Missing deterministicReplay session state " + f);
++                }
++                st = (SessionState) new XmlFile(XSTREAM, f).read();
++                st.file = f;
++                SESSIONS.put(key, st);
++                LOGGER.log(Level.FINE, "Reloaded determinism session {0} from {1}", new Object[] {sessionId, f});
++            }
++            return st;
++        }
++    }
++
++    // ------------------------------------------------------------------ interception
++
++    /**
++     * Called before a step inside a session starts. In VERIFY mode this may complete
++     * {@code context}, which tells {@code DSL} to skip {@code Step.start}.
++     */
++    static void intercept(
++            @NonNull ReplaySessionHandle handle,
++            @NonNull Step step,
++            @NonNull StepContext context,
++            @NonNull List<String> passthrough)
++            throws IOException, InterruptedException {
++        Run<?, ?> run = context.get(Run.class);
++        FlowNode node = context.get(FlowNode.class);
++        if (run == null || node == null) {
++            return;
++        }
++        SessionState st = session(run.getRootDir(), handle.getSessionId());
++        StepDescriptor d = step.getDescriptor();
++        String stepId = d.getFunctionName();
++        boolean block = isBlock(step, d, context);
++        String stream = streamKey(node, handle.getSessionId());
++        String args = ArgumentCanonicalizer.canonicalize(step);
++        String digest = ArgumentCanonicalizer.digest(args);
++
++        if (handle.getMode() == DeterminismMode.RECORD) {
++            synchronized (st) {
++                if (st.finished || st.nodes.containsKey(node.getId())) {
++                    return; // already recorded (e.g. re-entered after a restart)
++                }
++                List<TapeEntry> s = st.tape.streamForAppend(stream);
++                TapeEntry e = new TapeEntry(s.size(), stepId, args, digest, block);
++                s.add(e);
++                st.nodes.put(node.getId(), new SessionState.EntryRef(stream, e.getSeq()));
++                st.save();
++            }
++            return;
++        }
++
++        // VERIFY
++        String violation = null;
++        TapeEntry replay = null;
++        synchronized (st) {
++            if (st.finished) {
++                return;
++            }
++            if (!st.violations.isEmpty()) {
++                violation = st.violations.get(0);
++            } else {
++                SessionState.EntryRef ref = st.nodes.get(node.getId());
++                TapeEntry expected;
++                if (ref != null) {
++                    expected = st.tape.entry(ref.stream, ref.seq); // idempotent re-entry after restart
++                } else {
++                    int cursor = st.cursors.getOrDefault(stream, 0);
++                    expected = st.tape.entry(stream, cursor);
++                    if (expected == null) {
++                        violation = "unexpected step '" + stepId + "' (" + args + ") at position " + cursor
++                                + " of stream '" + stream + "': the recorded tape has no more entries there";
++                    } else if (!expected.getStepId().equals(stepId)) {
++                        violation = "expected step '" + expected.getStepId() + "' but got '" + stepId
++                                + "' at position " + cursor + " of stream '" + stream + "'";
++                    } else if (!expected.getArgumentsDigest().equals(digest)) {
++                        violation = "arguments of step '" + stepId + "' at position " + cursor + " of stream '"
++                                + stream + "' differ from the recording; expected " + expected.getArguments()
++                                + " but got " + args;
++                    } else {
++                        st.cursors.put(stream, cursor + 1);
++                        st.nodes.put(node.getId(), new SessionState.EntryRef(stream, cursor));
++                        st.verified++;
++                    }
++                }
++                if (violation == null && expected != null && !expected.isBlock() && !passthrough.contains(stepId)) {
++                    if (!expected.isReplayable()) {
++                        violation = "step '" + stepId + "' at position " + expected.getSeq() + " of stream '"
++                                + stream + "' cannot be replayed: " + expected.getNotReplayableReason();
++                    } else if (expected.getStatus() == TapeEntry.Status.PENDING) {
++                        violation = "step '" + stepId + "' at position " + expected.getSeq() + " of stream '"
++                                + stream + "' has no recorded outcome";
++                    } else {
++                        replay = expected;
++                        if (ref == null) {
++                            st.replayed++;
++                        }
++                    }
++                }
++                if (violation != null) {
++                    st.violations.add(violation);
++                }
++            }
++            st.save();
++        }
++
++        TaskListener listener = context.get(TaskListener.class);
++        PrintStream log = listener != null ? listener.getLogger() : null;
++        if (violation != null) {
++            if (log != null) {
++                log.println(LOG_PREFIX + "Determinism violation: " + violation);
++            }
++            context.onFailure(abort(violation));
++        } else if (replay != null) {
++            if (log != null) {
++                log.println(LOG_PREFIX + "Replayed '" + stepId + "' #" + replay.getSeq() + " of stream '" + stream
++                        + "' from tape (" + replay.getStatus() + "); side effects suppressed");
++            }
++            if (replay.getStatus() == TapeEntry.Status.FAILURE) {
++                context.onFailure(replay.getError());
++            } else {
++                context.onSuccess(replay.getValue());
++            }
++        }
++    }
++
++    private static boolean isBlock(Step step, StepDescriptor d, StepContext context) {
++        return context.hasBody()
++                || d.takesImplicitBlockArgument()
++                || step instanceof ParallelStep
++                || d instanceof LoadStep.DescriptorImpl;
++    }
++
++    /**
++     * Identifies the CPS branch execution path of a node, relative to the session block:
++     * {@code main} for the block's own thread, {@code main/a} inside branch {@code a} of a
++     * {@code parallel}, {@code main/a/x} for nested parallels, and so on.
++     */
++    static @NonNull String streamKey(@NonNull FlowNode node, @NonNull String sessionId) {
++        Deque<String> names = new ArrayDeque<>();
++        for (BlockStartNode b : node.iterateEnclosingBlocks()) {
++            if (b.getId().equals(sessionId)) {
++                break;
++            }
++            ThreadNameAction t = b.getPersistentAction(ThreadNameAction.class);
++            if (t != null) {
++                names.addFirst(t.getThreadName().replace("%", "%25").replace("/", "%2F"));
++            }
++        }
++        StringBuilder b = new StringBuilder(ExecutionTape.MAIN_STREAM);
++        for (String n : names) {
++            b.append('/').append(n);
++        }
++        return b.toString();
++    }
++
++    static @NonNull FlowInterruptedException abort(@NonNull String violation) {
++        return new FlowInterruptedException(Result.ABORTED, true, new DeterminismViolation(violation));
++    }
++
++    // ------------------------------------------------------------------ completion (RECORD)
++
++    /**
++     * Called by {@code CpsStepContext} the first time a step's outcome is set, before the CPS
++     * thread is resumed. Captures the outcome of steps recorded by an active RECORD session.
++     */
++    public static void stepCompleted(
++            @NonNull FlowExecutionOwner owner, @NonNull String nodeId, Object value, Throwable error) {
++        if (SESSIONS.isEmpty()) {
++            return;
++        }
++        String prefix;
++        try {
++            prefix = new File(new File(owner.getRootDir(), TAPE_DIR), SESSION_DIR).getAbsolutePath()
++                    + File.separator;
++        } catch (IOException x) {
++            return;
++        }
++        for (Map.Entry<String, SessionState> e : SESSIONS.entrySet()) {
++            if (!e.getKey().startsWith(prefix)) {
++                continue;
++            }
++            SessionState st = e.getValue();
++            if (st.mode != DeterminismMode.RECORD) {
++                continue;
++            }
++            synchronized (st) {
++                SessionState.EntryRef ref = st.nodes.get(nodeId);
++                if (ref == null || st.finished) {
++                    continue;
++                }
++                TapeEntry entry = st.tape.entry(ref.stream, ref.seq);
++                if (entry == null || entry.getStatus() != TapeEntry.Status.PENDING) {
++                    continue;
++                }
++                if (error != null) {
++                    entry.failed(error);
++                } else {
++                    entry.succeeded(value);
++                }
++                String problem = checkReplayable(entry);
++                if (problem != null) {
++                    entry.markNotReplayable(problem);
++                }
++                try {
++                    st.save();
++                } catch (IOException | RuntimeException x) {
++                    LOGGER.log(Level.WARNING, "Could not persist outcome of node " + nodeId, x);
++                }
++            }
++        }
++    }
++
++    /** Returns null if the outcome survives a round trip through the tape format. */
++    private static @CheckForNull String checkReplayable(TapeEntry entry) {
++        Object payload = entry.getStatus() == TapeEntry.Status.FAILURE ? entry.getError() : entry.getValue();
++        if (payload == null) {
++            return null;
++        }
++        try {
++            XSTREAM.fromXML(XSTREAM.toXML(payload));
++            return null;
++        } catch (RuntimeException | LinkageError x) {
++            return "outcome of type " + payload.getClass().getName() + " cannot be serialized: " + x;
++        }
++    }
++
++    // ------------------------------------------------------------------ finish
++
++    /**
++     * Called when the block body completes. Finalizes the tape (RECORD) or checks that every
++     * recorded row was consumed (VERIFY), attaches a {@link DeterminismAction} and returns the
++     * violation to abort the build with, if any.
++     */
++    static @CheckForNull FlowInterruptedException finish(
++            @NonNull Run<?, ?> run,
++            @NonNull String sessionId,
++            @CheckForNull Throwable bodyFailure,
++            @NonNull TaskListener listener)
++            throws IOException {
++        SessionState st = session(run.getRootDir(), sessionId);
++        DeterminismAction action;
++        List<String> violations;
++        synchronized (st) {
++            boolean bodyOk = bodyFailure == null;
++            String bodyMessage = bodyFailure == null ? null : String.valueOf(bodyFailure);
++            if (st.mode == DeterminismMode.RECORD) {
++                boolean interrupted = bodyFailure instanceof FlowInterruptedException;
++                st.tape.setComplete(!interrupted);
++                st.tape.save(tapeFile(run.getRootDir(), st.tapePath));
++                action = new DeterminismAction(
++                        st.sessionId,
++                        st.mode,
++                        st.tapePath,
++                        null,
++                        interrupted ? DeterminismAction.Status.INCOMPLETE : DeterminismAction.Status.RECORDED,
++                        st.tape.size(),
++                        0,
++                        0,
++                        bodyOk,
++                        bodyMessage,
++                        st.violations);
++                listener.getLogger()
++                        .println(LOG_PREFIX + "Recorded " + st.tape.size() + " step(s) to " + st.tapePath
++                                + (interrupted ? " (incomplete: build was interrupted)" : ""));
++            } else {
++                if (st.violations.isEmpty()) {
++                    for (Map.Entry<String, List<TapeEntry>> e :
++                            st.tape.getStreams().entrySet()) {
++                        int consumed = st.cursors.getOrDefault(e.getKey(), 0);
++                        if (consumed < e.getValue().size()) {
++                            TapeEntry next = e.getValue().get(consumed);
++                            st.violations.add("stream '" + e.getKey() + "' ended after " + consumed
++                                    + " step(s) but the tape recorded " + e.getValue().size() + "; next expected step '"
++                                    + next.getStepId() + "' (" + next.getArguments() + ") never ran");
++                        }
++                    }
++                }
++                boolean violated = !st.violations.isEmpty();
++                action = new DeterminismAction(
++                        st.sessionId,
++                        st.mode,
++                        st.tapePath,
++                        st.baselineBuild,
++                        violated ? DeterminismAction.Status.VIOLATED : DeterminismAction.Status.PASSED,
++                        st.tape.size(),
++                        st.verified,
++                        st.replayed,
++                        bodyOk,
++                        bodyMessage,
++                        st.violations);
++                listener.getLogger()
++                        .println(LOG_PREFIX + (violated ? "Verification FAILED: " + st.violations : "Verification passed")
++                                + " (" + st.verified + " verified, " + st.replayed + " replayed, body "
++                                + (bodyOk ? "succeeded" : "failed") + ")");
++                write(new File(tapeFile(run.getRootDir(), st.tapePath).getPath() + ".verify-" + st.sessionId + ".xml"),
++                        action);
++            }
++            violations = new ArrayList<>(st.violations);
++            st.finished = true;
++            st.save();
++        }
++        SESSIONS.remove(st.file.getAbsolutePath());
++        run.addAction(action);
++        if (!violations.isEmpty()) {
++            run.setResult(Result.ABORTED);
++            return abort(violations.get(0));
++        }
++        return null;
++    }
++
++    /** For tests: drops the in-memory registry, as a controller restart would. */
++    static void forgetAllSessions() {
++        SESSIONS.clear();
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismMode.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismMode.java
+new file mode 100644
+index 0000000..178b1bf
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismMode.java
+@@ -0,0 +1,26 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import edu.umd.cs.findbugs.annotations.NonNull;
++import java.util.Locale;
++
++/**
++ * Operating mode of a {@link DeterministicReplayStep} block.
++ */
++public enum DeterminismMode {
++    /** Execute every step normally and capture an ordered execution tape. */
++    RECORD,
++    /** Do not execute side-effecting steps; validate them against a tape and replay recorded outcomes. */
++    VERIFY;
++
++    public static @NonNull DeterminismMode parse(String value) {
++        if (value == null || value.trim().isEmpty()) {
++            throw new IllegalArgumentException("mode must be one of 'record' or 'verify'");
++        }
++        try {
++            return valueOf(value.trim().toUpperCase(Locale.ROOT));
++        } catch (IllegalArgumentException x) {
++            throw new IllegalArgumentException("Unknown deterministicReplay mode '" + value
++                    + "'; expected 'record' or 'verify'");
++        }
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismStepListener.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismStepListener.java
+new file mode 100644
+index 0000000..b71138a
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismStepListener.java
+@@ -0,0 +1,46 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import edu.umd.cs.findbugs.annotations.NonNull;
++import hudson.Extension;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++import org.jenkinsci.plugins.workflow.flow.StepListener;
++import org.jenkinsci.plugins.workflow.steps.Step;
++import org.jenkinsci.plugins.workflow.steps.StepContext;
++import org.kohsuke.accmod.Restricted;
++import org.kohsuke.accmod.restrictions.NoExternalUse;
++
++/**
++ * Hooks every step invocation; {@code DSL} calls this after the step is instantiated and its
++ * flow node created, but before {@code Step.start}. If the listener completes the context,
++ * the step is never started.
++ */
++@Extension
++@Restricted(NoExternalUse.class)
++public final class DeterminismStepListener implements StepListener {
++
++    private static final Logger LOGGER = Logger.getLogger(DeterminismStepListener.class.getName());
++
++    @Override
++    public void notifyOfNewStep(@NonNull Step step, @NonNull StepContext context) {
++        if (step instanceof DeterministicReplayStep) {
++            return; // nesting is rejected by the step itself
++        }
++        try {
++            ReplaySessionHandle handle = context.get(ReplaySessionHandle.class);
++            if (handle == null) {
++                return;
++            }
++            PassthroughSteps passthrough = context.get(PassthroughSteps.class);
++            DeterminismEngine.intercept(
++                    handle, step, context, passthrough != null ? passthrough.getStepIds() : java.util.List.of());
++        } catch (InterruptedException x) {
++            Thread.currentThread().interrupt();
++            context.onFailure(x);
++        } catch (Exception x) {
++            // Never let a broken tape silently execute side effects in VERIFY mode.
++            LOGGER.log(Level.WARNING, "deterministicReplay interception failed", x);
++            context.onFailure(x);
++        }
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismViolation.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismViolation.java
+new file mode 100644
+index 0000000..8f0a058
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismViolation.java
+@@ -0,0 +1,27 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import jenkins.model.CauseOfInterruption;
++
++/**
++ * Cause attached to the {@code FlowInterruptedException} used to abort a build whose
++ * verification diverged from the recorded tape.
++ */
++public final class DeterminismViolation extends CauseOfInterruption {
++
++    private static final long serialVersionUID = 1L;
++
++    private final String message;
++
++    public DeterminismViolation(String message) {
++        this.message = message;
++    }
++
++    public String getMessage() {
++        return message;
++    }
++
++    @Override
++    public String getShortDescription() {
++        return "Determinism violation: " + message;
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep.java
+new file mode 100644
+index 0000000..fa0dfbf
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep.java
+@@ -0,0 +1,212 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import edu.umd.cs.findbugs.annotations.CheckForNull;
++import edu.umd.cs.findbugs.annotations.NonNull;
++import hudson.AbortException;
++import hudson.Extension;
++import hudson.model.Run;
++import hudson.model.TaskListener;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Set;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++import org.jenkinsci.plugins.workflow.graph.FlowNode;
++import org.jenkinsci.plugins.workflow.steps.AbstractStepExecutionImpl;
++import org.jenkinsci.plugins.workflow.steps.BodyExecutionCallback;
++import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException;
++import org.jenkinsci.plugins.workflow.steps.Step;
++import org.jenkinsci.plugins.workflow.steps.StepContext;
++import org.jenkinsci.plugins.workflow.steps.StepDescriptor;
++import org.jenkinsci.plugins.workflow.steps.StepExecution;
++import org.kohsuke.stapler.DataBoundConstructor;
++import org.kohsuke.stapler.DataBoundSetter;
++
++/**
++ * {@code deterministicReplay(mode: 'record'|'verify', tapePath: 'name.xml') { … }}
++ * <p>
++ * RECORD runs the body normally and writes an ordered execution tape of every step it runs to
++ * {@code <build dir>/replay-tapes/<tapePath>}. VERIFY loads that tape from a baseline build
++ * (the most recent earlier build that recorded it, or {@code baselineBuild}), and instead of
++ * starting each step validates its id and arguments against the next expected tape row and
++ * resumes the CPS continuation with the recorded outcome. A mismatch aborts the build.
++ */
++public final class DeterministicReplayStep extends Step {
++
++    private final DeterminismMode mode;
++    private final String tapePath;
++    private Integer baselineBuild;
++    private List<String> passthrough = new ArrayList<>();
++
++    @DataBoundConstructor
++    public DeterministicReplayStep(String mode, String tapePath) {
++        this.mode = DeterminismMode.parse(mode);
++        this.tapePath = DeterminismEngine.validateTapePath(tapePath);
++    }
++
++    public String getMode() {
++        return mode.name().toLowerCase(java.util.Locale.ROOT);
++    }
++
++    public String getTapePath() {
++        return tapePath;
++    }
++
++    public @CheckForNull Integer getBaselineBuild() {
++        return baselineBuild;
++    }
++
++    /** VERIFY only: number of the build whose tape to verify against. Defaults to the latest build that recorded it. */
++    @DataBoundSetter
++    public void setBaselineBuild(Integer baselineBuild) {
++        this.baselineBuild = baselineBuild;
++    }
++
++    public List<String> getPassthrough() {
++        return passthrough;
++    }
++
++    /**
++     * VERIFY only: function names of steps (e.g. {@code input}) that are validated against the
++     * tape but executed for real instead of being replayed.
++     */
++    @DataBoundSetter
++    public void setPassthrough(List<String> passthrough) {
++        this.passthrough = passthrough == null ? new ArrayList<>() : new ArrayList<>(passthrough);
++    }
++
++    @Override
++    public StepExecution start(StepContext context) throws Exception {
++        return new Execution(context, mode, tapePath, baselineBuild, passthrough);
++    }
++
++    public static final class Execution extends AbstractStepExecutionImpl {
++
++        private static final long serialVersionUID = 1L;
++
++        private final DeterminismMode mode;
++        private final String tapePath;
++        private final Integer baselineBuild;
++        private final ArrayList<String> passthrough;
++        private String sessionId;
++
++        Execution(
++                StepContext context,
++                DeterminismMode mode,
++                String tapePath,
++                Integer baselineBuild,
++                List<String> passthrough) {
++            super(context);
++            this.mode = mode;
++            this.tapePath = tapePath;
++            this.baselineBuild = baselineBuild;
++            this.passthrough = new ArrayList<>(passthrough);
++        }
++
++        @Override
++        public boolean start() throws Exception {
++            StepContext context = getContext();
++            if (context.get(ReplaySessionHandle.class) != null) {
++                throw new AbortException("deterministicReplay blocks cannot be nested");
++            }
++            Run<?, ?> run = context.get(Run.class);
++            FlowNode node = context.get(FlowNode.class);
++            TaskListener listener = context.get(TaskListener.class);
++            sessionId = node.getId();
++            DeterminismEngine.open(run, sessionId, mode, tapePath, baselineBuild, listener);
++            context.newBodyInvoker()
++                    .withContexts(new ReplaySessionHandle(sessionId, mode), new PassthroughSteps(passthrough))
++                    .withCallback(new Callback(sessionId))
++                    .start();
++            return false;
++        }
++
++        @Override
++        public void onResume() {
++            // Re-register the session after a controller restart before in-flight steps report back.
++            try {
++                Run<?, ?> run = getContext().get(Run.class);
++                if (run != null && sessionId != null) {
++                    DeterminismEngine.session(run.getRootDir(), sessionId);
++                }
++            } catch (Exception x) {
++                Logger.getLogger(Execution.class.getName())
++                        .log(Level.WARNING, "Could not reload deterministicReplay session " + sessionId, x);
++            }
++        }
++
++        @Override
++        public String getStatus() {
++            return mode + " " + tapePath + " (session " + sessionId + ")";
++        }
++    }
++
++    private static final class Callback extends BodyExecutionCallback {
++
++        private static final long serialVersionUID = 1L;
++
++        private final String sessionId;
++
++        Callback(String sessionId) {
++            this.sessionId = sessionId;
++        }
++
++        @Override
++        public void onSuccess(StepContext context, Object result) {
++            complete(context, result, null);
++        }
++
++        @Override
++        public void onFailure(StepContext context, Throwable t) {
++            complete(context, null, t);
++        }
++
++        private void complete(StepContext context, Object result, Throwable failure) {
++            try {
++                Run<?, ?> run = context.get(Run.class);
++                TaskListener listener = context.get(TaskListener.class);
++                FlowInterruptedException violation = DeterminismEngine.finish(run, sessionId, failure, listener);
++                if (violation != null) {
++                    if (failure != null && failure != violation) {
++                        violation.addSuppressed(failure);
++                    }
++                    context.onFailure(violation);
++                } else if (failure != null) {
++                    context.onFailure(failure);
++                } else {
++                    context.onSuccess(result);
++                }
++            } catch (Exception x) {
++                if (failure != null) {
++                    x.addSuppressed(failure);
++                }
++                context.onFailure(x);
++            }
++        }
++    }
++
++    @Extension
++    public static final class DescriptorImpl extends StepDescriptor {
++
++        @Override
++        public String getFunctionName() {
++            return "deterministicReplay";
++        }
++
++        @NonNull
++        @Override
++        public String getDisplayName() {
++            return "Record or verify a deterministic execution tape";
++        }
++
++        @Override
++        public boolean takesImplicitBlockArgument() {
++            return true;
++        }
++
++        @Override
++        public Set<? extends Class<?>> getRequiredContext() {
++            return Set.of(Run.class, FlowNode.class, TaskListener.class);
++        }
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ExecutionTape.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ExecutionTape.java
+new file mode 100644
+index 0000000..12dfade
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ExecutionTape.java
+@@ -0,0 +1,102 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import edu.umd.cs.findbugs.annotations.CheckForNull;
++import edu.umd.cs.findbugs.annotations.NonNull;
++import hudson.XmlFile;
++import java.io.File;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
++
++/**
++ * Ordered execution table captured by a {@code deterministicReplay(mode: 'record')} block.
++ * <p>
++ * Entries are kept per <em>stream</em>: one stream per CPS branch execution path
++ * ({@code main}, {@code main/branchA}, {@code main/branchA/inner}, …) so that the relative
++ * interleaving of concurrent {@code parallel} branches does not affect verification.
++ */
++public final class ExecutionTape {
++
++    public static final int FORMAT_VERSION = 1;
++
++    public static final String MAIN_STREAM = "main";
++
++    private int formatVersion = FORMAT_VERSION;
++    private String job;
++    private int build;
++    private boolean complete;
++    private final TreeMap<String, List<TapeEntry>> streams = new TreeMap<>();
++
++    ExecutionTape(String job, int build) {
++        this.job = job;
++        this.build = build;
++    }
++
++    public int getFormatVersion() {
++        return formatVersion;
++    }
++
++    public String getJob() {
++        return job;
++    }
++
++    public int getBuild() {
++        return build;
++    }
++
++    /** True once the recording block finished; only complete tapes may be verified against. */
++    public boolean isComplete() {
++        return complete;
++    }
++
++    void setComplete(boolean complete) {
++        this.complete = complete;
++    }
++
++    /** Read-only view of the streams. */
++    public @NonNull Map<String, List<TapeEntry>> getStreams() {
++        Map<String, List<TapeEntry>> copy = new TreeMap<>();
++        streams.forEach((k, v) -> copy.put(k, Collections.unmodifiableList(new ArrayList<>(v))));
++        return Collections.unmodifiableMap(copy);
++    }
++
++    public @NonNull List<TapeEntry> getStream(String key) {
++        List<TapeEntry> s = streams.get(key);
++        return s == null ? Collections.emptyList() : Collections.unmodifiableList(s);
++    }
++
++    public int size() {
++        return streams.values().stream().mapToInt(List::size).sum();
++    }
++
++    @NonNull
++    List<TapeEntry> streamForAppend(String key) {
++        return streams.computeIfAbsent(key, k -> new ArrayList<>());
++    }
++
++    @CheckForNull
++    TapeEntry entry(String stream, int seq) {
++        List<TapeEntry> s = streams.get(stream);
++        return s == null || seq < 0 || seq >= s.size() ? null : s.get(seq);
++    }
++
++    /** Loads a tape written by a recording build. */
++    public static @NonNull ExecutionTape load(@NonNull File file) throws IOException {
++        Object o = new XmlFile(DeterminismEngine.XSTREAM, file).read();
++        if (!(o instanceof ExecutionTape)) {
++            throw new IOException(file + " does not contain an execution tape");
++        }
++        ExecutionTape t = (ExecutionTape) o;
++        if (t.formatVersion != FORMAT_VERSION) {
++            throw new IOException("Unsupported execution tape format " + t.formatVersion + " in " + file);
++        }
++        return t;
++    }
++
++    void save(@NonNull File file) throws IOException {
++        DeterminismEngine.write(file, this);
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/PassthroughSteps.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/PassthroughSteps.java
+new file mode 100644
+index 0000000..d7f479d
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/PassthroughSteps.java
+@@ -0,0 +1,22 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import java.io.Serializable;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++/** Context object listing step ids that are validated in VERIFY mode but executed live. */
++public final class PassthroughSteps implements Serializable {
++
++    private static final long serialVersionUID = 1L;
++
++    private final ArrayList<String> stepIds;
++
++    PassthroughSteps(List<String> stepIds) {
++        this.stepIds = new ArrayList<>(stepIds);
++    }
++
++    public List<String> getStepIds() {
++        return Collections.unmodifiableList(stepIds);
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ReplaySessionHandle.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ReplaySessionHandle.java
+new file mode 100644
+index 0000000..a9d623d
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ReplaySessionHandle.java
+@@ -0,0 +1,35 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import java.io.Serializable;
++
++/**
++ * Context object injected into the body of a {@code deterministicReplay} block.
++ * Every step invoked inside the body can find its owning session via
++ * {@code StepContext.get(ReplaySessionHandle.class)}; parallel branches inherit it.
++ * It is deliberately tiny: all mutable state lives in {@link SessionState} on disk.
++ */
++public final class ReplaySessionHandle implements Serializable {
++
++    private static final long serialVersionUID = 1L;
++
++    private final String sessionId;
++    private final DeterminismMode mode;
++
++    ReplaySessionHandle(String sessionId, DeterminismMode mode) {
++        this.sessionId = sessionId;
++        this.mode = mode;
++    }
++
++    public String getSessionId() {
++        return sessionId;
++    }
++
++    public DeterminismMode getMode() {
++        return mode;
++    }
++
++    @Override
++    public String toString() {
++        return "ReplaySession[" + sessionId + "," + mode + "]";
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/SessionState.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/SessionState.java
+new file mode 100644
+index 0000000..1581713
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/SessionState.java
+@@ -0,0 +1,59 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import java.io.File;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
++
++/**
++ * Durable, mutable state of one {@code deterministicReplay} block in one build.
++ * Persisted under {@code <build>/replay-tapes/.sessions/<sessionId>.xml} after every mutation
++ * so that recording and verification resume where they left off after a controller restart.
++ * All access must be synchronized on the instance.
++ */
++final class SessionState {
++
++    /** Reference from a flow node id to the tape row it produced/consumed (makes interception idempotent). */
++    static final class EntryRef {
++        final String stream;
++        final int seq;
++
++        EntryRef(String stream, int seq) {
++            this.stream = stream;
++            this.seq = seq;
++        }
++    }
++
++    final String sessionId;
++    final DeterminismMode mode;
++    final String tapePath;
++    /** VERIFY only: number of the build whose tape is being replayed. */
++    int baselineBuild;
++
++    /** RECORD: tape under construction. VERIFY: tape loaded from the baseline build. */
++    ExecutionTape tape;
++
++    /** VERIFY: next expected position per stream. */
++    final Map<String, Integer> cursors = new TreeMap<>();
++    /** Flow node id → tape row. */
++    final Map<String, EntryRef> nodes = new HashMap<>();
++    final List<String> violations = new ArrayList<>();
++    int verified;
++    int replayed;
++    boolean finished;
++
++    transient File file;
++
++    SessionState(String sessionId, DeterminismMode mode, String tapePath) {
++        this.sessionId = sessionId;
++        this.mode = mode;
++        this.tapePath = tapePath;
++    }
++
++    void save() throws IOException {
++        DeterminismEngine.write(file, this);
++    }
++}
+diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/TapeEntry.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/TapeEntry.java
+new file mode 100644
+index 0000000..3816085
+--- /dev/null
++++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/TapeEntry.java
+@@ -0,0 +1,105 @@
++package org.jenkinsci.plugins.workflow.cps.determinism;
++
++import edu.umd.cs.findbugs.annotations.CheckForNull;
++
++/**
++ * One row of an {@link ExecutionTape}: a single step invocation observed on a given stream.
++ */
++public final class TapeEntry {
++
++    public enum Status {
++        /** The step started but its outcome has not been observed (yet). */
++        PENDING,
++        SUCCESS,
++        FAILURE
++    }
++
++    /** Position of this entry within its stream (0-based). */
++    private final int seq;
++    /** {@code StepDescriptor#getFunctionName()} of the step, e.g. {@code sh}. */
++    private final String stepId;
++    /** Canonical, deterministic rendering of the step arguments. */
++    private final String arguments;
++    /** SHA-256 of {@link #arguments}; used for matching. */
++    private final String argumentsDigest;
++    /** True for block-scoped steps (bodies, {@code parallel}, {@code load}); those are validated but never replayed. */
++    private final boolean block;
++
++    private Status status = Status.PENDING;
++    private Object value;
++    private Throwable error;
++    private boolean replayable = true;
++    private String notReplayableReason;
++
++    TapeEntry(int seq, String stepId, String arguments, String argumentsDigest, boolean block) {
++        this.seq = seq;
++        this.stepId = stepId;
++        this.arguments = arguments;
++        this.argumentsDigest = argumentsDigest;
++        this.block = block;
++    }
++
++    public int getSeq() {
++        return seq;
++    }
++
++    public String getStepId() {
++        return stepId;
++    }
++
++    public String getArguments() {
++        return arguments;
++    }
++
++    public String getArgumentsDigest() {
++        return argumentsDigest;
++    }
++
++    public boolean isBlock() {
++        return block;
++    }
++
++    public Status getStatus() {
++        return status;
++    }
++
++    public @CheckForNull Object getValue() {
++        return value;
++    }
++
++    public @CheckForNull Throwable getError() {
++        return error;
++    }
++
++    public boolean isReplayable() {
++        return replayable;
++    }
++
++    public @CheckForNull String getNotReplayableReason() {
++        return notReplayableReason;
++    }
++
++    void succeeded(Object value) {
++        this.status = Status.SUCCESS;
++        this.value = value;
++        this.error = null;
++    }
++
++    void failed(Throwable error) {
++        this.status = Status.FAILURE;
++        this.value = null;
++        this.error = error;
++    }
++
++    void markNotReplayable(String reason) {
++        this.replayable = false;
++        this.notReplayableReason = reason;
++        this.value = null;
++        this.error = null;
++    }
++
++    @Override
++    public String toString() {
++        return "#" + seq + " " + stepId + "(" + arguments + ") -> " + status;
++    }
++}
+diff --git a/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/config.jelly b/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/config.jelly
+new file mode 100644
+index 0000000..6fafd56
+--- /dev/null
++++ b/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/config.jelly
+@@ -0,0 +1,12 @@
++<?jelly escape-by-default='true'?>
++<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
++    <f:entry field="mode" title="Mode (record or verify)">
++        <f:textbox/>
++    </f:entry>
++    <f:entry field="tapePath" title="Tape path (relative to the build directory)">
++        <f:textbox/>
++    </f:entry>
++    <f:entry field="baselineBuild" title="Baseline build number (verify only)">
++        <f:number/>
++    </f:entry>
++</j:jelly>
+diff --git a/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/help.html b/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/help.html
+new file mode 100644
+index 0000000..b571cbd
+--- /dev/null
++++ b/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/help.html
+@@ -0,0 +1,5 @@
++<div>
++  Records every step executed inside the block to an execution tape (<code>mode: 'record'</code>),
++  or validates every step against a previously recorded tape and replays the recorded outcomes
++  without executing side effects (<code>mode: 'verify'</code>). Any divergence aborts the build.
++</div>
