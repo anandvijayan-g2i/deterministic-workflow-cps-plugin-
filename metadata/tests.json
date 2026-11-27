@@ -1,47 +1,137 @@
-
 {
   "tests": [
     {
       "id": "cps_step_context_test",
-      "checks": "CPS StepContext behavior must remain compatible with the replay step.",
+      "checks": "CpsStepContextTest still passes: existing CPS StepContext behaviour is unchanged by the step listener hook.",
       "tier": "must",
       "implicit": true,
-      "evidence": "Preserve existing CPS step-context execution because replay must work with normal Pipeline steps."
+      "evidence": "Regression guard; the prompt asks for a new step inside the existing plugin, so existing behaviour must not break."
     },
     {
       "id": "parallel_step_test",
-      "checks": "Parallel Step behavior must remain compatible with deterministic replay.",
+      "checks": "ParallelStepTest still passes: parallel branches are unaffected by the replay hook.",
       "tier": "must",
       "implicit": true,
-      "evidence": "Preserve existing Parallel Step behavior while replay executes and validates block steps."
+      "evidence": "Regression guard; the prompt asks for a new step inside the existing plugin, so existing behaviour must not break."
     },
     {
       "id": "cps_body_execution_test",
-      "checks": "CPS body execution must remain compatible with replay blocks.",
+      "checks": "CpsBodyExecutionTest still passes: block body execution is unaffected by the replay hook.",
       "tier": "must",
-      "implicit": false,
-      "evidence": "Preserve existing CPS body execution while replay and verification run a block."
+      "implicit": true,
+      "evidence": "Regression guard; the prompt asks for a new step inside the existing plugin, so existing behaviour must not break."
     },
     {
-      "id": "deterministic_replay_record_test",
-      "checks": "Record mode must execute the body and save steps and outcomes for later verification.",
+      "id": "record_writes_tape",
+      "checks": "DeterministicReplayRecordTest#recordsOrderedTapeWithReturnValuesAndFailures and #recordsNondeterministicValuesAndBlockSteps: record mode runs the body normally and writes a tape under the build's replay-tapes directory.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "In record mode, execute the body and save the steps and outcomes for later verification. A tape is stored under the build's replay-tapes directory."
+    },
+    {
+      "id": "record_body_failure_still_writes_tape",
+      "checks": "DeterministicReplayRecordTest#recordingABodyFailureStillProducesACompleteTape: a failing body still fails the build and still leaves a tape.",
       "tier": "must",
       "implicit": false,
       "evidence": "In record mode, execute the body and save the steps and outcomes for later verification."
     },
     {
-      "id": "deterministic_replay_verify_test",
-      "checks": "Verify mode must replay outcomes without repeating side effects and select the correct baseline.",
+      "id": "rejects_invalid_parameters",
+      "checks": "DeterministicReplayRecordTest#rejectsUnsafeTapePathAndNesting: '..' and absolute tape paths, unknown modes and nested blocks fail with the stated messages.",
       "tier": "must",
       "implicit": false,
-      "evidence": "In verify mode, replay recorded outcomes without repeating side effects and execute passthrough steps normally."
+      "evidence": "Reject invalid paths, unknown modes, or nested blocks with errors containing tapePath must be a relative path, Unknown deterministicReplay mode, or cannot be nested."
     },
     {
-      "id": "determinism_drift_test",
-      "checks": "Determinism drift must abort the build and prevent mismatched or later steps from running.",
+      "id": "only_block_steps_are_recorded",
+      "checks": "DeterministicReplayRecordTest#stepsOutsideTheBlockAreNotRecorded: different steps before and after the block in record and verify still verify successfully, and steps after the block run normally.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "In record mode, execute the body and save the steps and outcomes for later verification. In verify mode, compare the body with the recorded tape."
+    },
+    {
+      "id": "verify_replays_values_without_side_effects",
+      "checks": "DeterministicReplayVerifyTest#replaysRecordedOutcomesWithoutReExecutingSideEffects: sh stdout and readFile results come from the tape and the sh side effect does not run again.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "In verify mode, compare the body with the recorded tape and replay recorded step outcomes without repeating side effects."
+    },
+    {
+      "id": "verify_replays_failures_and_statuses",
+      "checks": "DeterministicReplayVerifyTest#replaysRecordedFailuresAndStatuses: returnStatus codes and caught step failures are replayed without running the steps.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "In verify mode, compare the body with the recorded tape and replay recorded step outcomes without repeating side effects."
+    },
+    {
+      "id": "verify_replays_body_failure",
+      "checks": "DeterministicReplayVerifyTest#bodyFailureIsReplayedAndReportedButIsNotADeterminismViolation: a recorded body failure is replayed as FAILURE, not treated as drift.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "In verify mode, compare the body with the recorded tape and replay recorded step outcomes without repeating side effects."
+    },
+    {
+      "id": "verify_uses_latest_recording",
+      "checks": "DeterministicReplayVerifyTest#verifyDefaultsToMostRecentRecording: with two earlier recordings, verify replays the most recent one.",
       "tier": "must",
       "implicit": true,
+      "evidence": "The prompt says an earlier recorded tape is used; picking the latest is the natural reading."
+    },
+    {
+      "id": "verify_without_tape_fails",
+      "checks": "DeterministicReplayVerifyTest#verifyWithoutRecordedTapeFails: verify with no earlier tape fails with 'recorded execution tape <tapePath>'.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "If no earlier recorded tape is available, the build fails with a message containing recorded execution tape <tapePath>."
+    },
+    {
+      "id": "verify_runs_block_bodies",
+      "checks": "DeterministicReplayVerifyTest#blockStepsAreValidatedButTheirBodiesStillRun: a dir block's body runs in verify mode while the sh inside it is replayed.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "Block steps such as node, dir, or withEnv are checked against the tape, but their bodies still run and the steps inside them are replayed."
+    },
+    {
+      "id": "drift_mismatched_arguments",
+      "checks": "DeterminismDriftTest#mismatchedArgumentsAbortWithoutRunningTheStep: changed sh arguments abort the build (ABORTED) and the drifted command never runs.",
+      "tier": "must",
+      "implicit": false,
       "evidence": "Abort the build on drift, extra or missing steps, or mismatched arguments or step names."
+    },
+    {
+      "id": "drift_mismatched_step_name",
+      "checks": "DeterminismDriftTest#mismatchedStepNameAborts: a different step name aborts the build and later steps neither run nor replay.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "Abort the build on drift, extra or missing steps, or mismatched arguments or step names."
+    },
+    {
+      "id": "drift_extra_step",
+      "checks": "DeterminismDriftTest#extraStepAborts: a step beyond the end of the tape aborts the build.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "Abort the build on drift, extra or missing steps, or mismatched arguments or step names."
+    },
+    {
+      "id": "drift_missing_step",
+      "checks": "DeterminismDriftTest#missingStepAborts: a recorded step that never runs aborts the build when the block ends.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "Abort the build on drift, extra or missing steps, or mismatched arguments or step names."
+    },
+    {
+      "id": "drift_step_order",
+      "checks": "DeterminismDriftTest#differentStepOrderAborts: reordered steps abort the build and neither reordered step runs.",
+      "tier": "must",
+      "implicit": false,
+      "evidence": "Abort the build on drift, extra or missing steps, or mismatched arguments or step names."
+    },
+    {
+      "id": "drift_not_swallowable",
+      "checks": "DeterminismDriftTest#violationCannotBeSwallowedByTryCatch: try/catch around a drifting step cannot stop the abort, and later steps do not run.",
+      "tier": "must",
+      "implicit": true,
+      "evidence": "Abort the build on drift; an abort that a try/catch could swallow would not abort the build."
     }
   ],
   "rubrics": []

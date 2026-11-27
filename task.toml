@@ -27,27 +27,15 @@ pass_to_pass = [
 [verifier]
 timeout_sec = 3600.0
 user = "root"
-environment_mode = "separate"
-network_mode = "allowlist"
-allowed_hosts = []
+environment_mode = "shared"
 
 [agent]
 timeout_sec = 3600.0
-network_mode = "allowlist"
-allowed_hosts = []
 
 [environment]
-# Allow image preparation to download Maven dependencies; runtime phases use an empty allowlist.
-network_mode = "public"
+# Network is needed only while building the image (Docker Hub, Maven Central, repo.jenkins-ci.org).
 build_timeout_sec = 3600
 workdir = "/app"
-cpus = 4
-memory_mb = 9216
-storage_mb = 20480
-
-[verifier.environment]
-network_mode = "public"
-build_timeout_sec = 3600
 cpus = 4
 memory_mb = 9216
 storage_mb = 20480

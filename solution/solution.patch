@@ -147,7 +147,7 @@ new file mode 100644
 index 0000000..a0e6a96
 --- /dev/null
 +++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismAction.java
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,110 @@
 +package org.jenkinsci.plugins.workflow.cps.determinism;
 +
 +import edu.umd.cs.findbugs.annotations.CheckForNull;
@@ -208,8 +208,7 @@ index 0000000..a0e6a96
 +        this.replayed = replayed;
 +        this.bodySucceeded = bodySucceeded;
 +        this.bodyFailure = bodyFailure;
-+        this.violations = new ArrayList<>();
-+        violations.forEach(v -> this.violations.add("\"[deterministicReplay] Determinism violation:\" " + v));
++        this.violations = new ArrayList<>(violations);
 +    }
 +
 +    public String getSessionId() {
@@ -261,10 +260,10 @@ index 0000000..a0e6a96
 +}
 diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismEngine.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismEngine.java
 new file mode 100644
-index 0000000..c736efb
+index 0000000..5e2cedd
 --- /dev/null
 +++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismEngine.java
-@@ -0,0 +1,504 @@
+@@ -0,0 +1,492 @@
 +package org.jenkinsci.plugins.workflow.cps.determinism;
 +
 +import edu.umd.cs.findbugs.annotations.CheckForNull;
@@ -393,7 +392,6 @@ index 0000000..c736efb
 +            @NonNull String sessionId,
 +            @NonNull DeterminismMode mode,
 +            @NonNull String tapePath,
-+            @CheckForNull Integer baselineBuild,
 +            @NonNull TaskListener listener)
 +            throws IOException {
 +        File stateFile = stateFile(run.getRootDir(), sessionId);
@@ -403,7 +401,7 @@ index 0000000..c736efb
 +            st.tape = new ExecutionTape(run.getParent().getFullName(), run.getNumber());
 +            listener.getLogger().println(LOG_PREFIX + "Recording execution tape to " + tapePath);
 +        } else {
-+            Run<?, ?> baseline = findBaseline(run, tapePath, baselineBuild);
++            Run<?, ?> baseline = findBaseline(run, tapePath);
 +            File source = tapeFile(baseline, tapePath);
 +            ExecutionTape tape = ExecutionTape.load(source);
 +            if (!tape.isComplete()) {
@@ -422,19 +420,9 @@ index 0000000..c736efb
 +    }
 +
 +    private static @NonNull Run<?, ?> findBaseline(
-+            @NonNull Run<?, ?> run, @NonNull String tapePath, @CheckForNull Integer baselineBuild)
++            @NonNull Run<?, ?> run, @NonNull String tapePath)
 +            throws AbortException {
 +        Job<?, ?> job = run.getParent();
-+        if (baselineBuild != null) {
-+            Run<?, ?> b = job.getBuildByNumber(baselineBuild);
-+            if (b == null || b == run) {
-+                throw new AbortException("Baseline build #" + baselineBuild + " not found");
-+            }
-+            if (!tapeFile(b, tapePath).isFile()) {
-+                throw new AbortException("Baseline build #" + baselineBuild + " has no execution tape " + tapePath);
-+            }
-+            return b;
-+        }
 +        for (Run<?, ?> b = run.getPreviousBuild(); b != null; b = b.getPreviousBuild()) {
 +            if (tapeFile(b, tapePath).isFile()) {
 +                return b;
@@ -475,8 +463,7 @@ index 0000000..c736efb
 +    static void intercept(
 +            @NonNull ReplaySessionHandle handle,
 +            @NonNull Step step,
-+            @NonNull StepContext context,
-+            @NonNull List<String> passthrough)
++            @NonNull StepContext context)
 +            throws IOException, InterruptedException {
 +        Run<?, ?> run = context.get(Run.class);
 +        FlowNode node = context.get(FlowNode.class);
@@ -538,7 +525,7 @@ index 0000000..c736efb
 +                        st.verified++;
 +                    }
 +                }
-+                if (violation == null && expected != null && !expected.isBlock() && !passthrough.contains(stepId)) {
++                if (violation == null && expected != null && !expected.isBlock()) {
 +                    if (!expected.isReplayable()) {
 +                        violation = "step '" + stepId + "' at position " + expected.getSeq() + " of stream '"
 +                                + stream + "' cannot be replayed: " + expected.getNotReplayableReason();
@@ -803,10 +790,10 @@ index 0000000..178b1bf
 +}
 diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismStepListener.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismStepListener.java
 new file mode 100644
-index 0000000..b71138a
+index 0000000..aa3d7dc
 --- /dev/null
 +++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterminismStepListener.java
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,44 @@
 +package org.jenkinsci.plugins.workflow.cps.determinism;
 +
 +import edu.umd.cs.findbugs.annotations.NonNull;
@@ -840,9 +827,7 @@ index 0000000..b71138a
 +            if (handle == null) {
 +                return;
 +            }
-+            PassthroughSteps passthrough = context.get(PassthroughSteps.class);
-+            DeterminismEngine.intercept(
-+                    handle, step, context, passthrough != null ? passthrough.getStepIds() : java.util.List.of());
++            DeterminismEngine.intercept(handle, step, context);
 +        } catch (InterruptedException x) {
 +            Thread.currentThread().interrupt();
 +            context.onFailure(x);
@@ -888,20 +873,17 @@ index 0000000..8f0a058
 +}
 diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep.java
 new file mode 100644
-index 0000000..fa0dfbf
+index 0000000..f56f7e7
 --- /dev/null
 +++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep.java
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,174 @@
 +package org.jenkinsci.plugins.workflow.cps.determinism;
 +
-+import edu.umd.cs.findbugs.annotations.CheckForNull;
 +import edu.umd.cs.findbugs.annotations.NonNull;
 +import hudson.AbortException;
 +import hudson.Extension;
 +import hudson.model.Run;
 +import hudson.model.TaskListener;
-+import java.util.ArrayList;
-+import java.util.List;
 +import java.util.Set;
 +import java.util.logging.Level;
 +import java.util.logging.Logger;
@@ -914,14 +896,13 @@ index 0000000..fa0dfbf
 +import org.jenkinsci.plugins.workflow.steps.StepDescriptor;
 +import org.jenkinsci.plugins.workflow.steps.StepExecution;
 +import org.kohsuke.stapler.DataBoundConstructor;
-+import org.kohsuke.stapler.DataBoundSetter;
 +
 +/**
 + * {@code deterministicReplay(mode: 'record'|'verify', tapePath: 'name.xml') { … }}
 + * <p>
 + * RECORD runs the body normally and writes an ordered execution tape of every step it runs to
 + * {@code <build dir>/replay-tapes/<tapePath>}. VERIFY loads that tape from a baseline build
-+ * (the most recent earlier build that recorded it, or {@code baselineBuild}), and instead of
++ * (the most recent earlier build that recorded it), and instead of
 + * starting each step validates its id and arguments against the next expected tape row and
 + * resumes the CPS continuation with the recorded outcome. A mismatch aborts the build.
 + */
@@ -929,8 +910,6 @@ index 0000000..fa0dfbf
 +
 +    private final DeterminismMode mode;
 +    private final String tapePath;
-+    private Integer baselineBuild;
-+    private List<String> passthrough = new ArrayList<>();
 +
 +    @DataBoundConstructor
 +    public DeterministicReplayStep(String mode, String tapePath) {
@@ -946,32 +925,9 @@ index 0000000..fa0dfbf
 +        return tapePath;
 +    }
 +
-+    public @CheckForNull Integer getBaselineBuild() {
-+        return baselineBuild;
-+    }
-+
-+    /** VERIFY only: number of the build whose tape to verify against. Defaults to the latest build that recorded it. */
-+    @DataBoundSetter
-+    public void setBaselineBuild(Integer baselineBuild) {
-+        this.baselineBuild = baselineBuild;
-+    }
-+
-+    public List<String> getPassthrough() {
-+        return passthrough;
-+    }
-+
-+    /**
-+     * VERIFY only: function names of steps (e.g. {@code input}) that are validated against the
-+     * tape but executed for real instead of being replayed.
-+     */
-+    @DataBoundSetter
-+    public void setPassthrough(List<String> passthrough) {
-+        this.passthrough = passthrough == null ? new ArrayList<>() : new ArrayList<>(passthrough);
-+    }
-+
 +    @Override
 +    public StepExecution start(StepContext context) throws Exception {
-+        return new Execution(context, mode, tapePath, baselineBuild, passthrough);
++        return new Execution(context, mode, tapePath);
 +    }
 +
 +    public static final class Execution extends AbstractStepExecutionImpl {
@@ -980,21 +936,12 @@ index 0000000..fa0dfbf
 +
 +        private final DeterminismMode mode;
 +        private final String tapePath;
-+        private final Integer baselineBuild;
-+        private final ArrayList<String> passthrough;
 +        private String sessionId;
 +
-+        Execution(
-+                StepContext context,
-+                DeterminismMode mode,
-+                String tapePath,
-+                Integer baselineBuild,
-+                List<String> passthrough) {
++        Execution(StepContext context, DeterminismMode mode, String tapePath) {
 +            super(context);
 +            this.mode = mode;
 +            this.tapePath = tapePath;
-+            this.baselineBuild = baselineBuild;
-+            this.passthrough = new ArrayList<>(passthrough);
 +        }
 +
 +        @Override
@@ -1007,9 +954,9 @@ index 0000000..fa0dfbf
 +            FlowNode node = context.get(FlowNode.class);
 +            TaskListener listener = context.get(TaskListener.class);
 +            sessionId = node.getId();
-+            DeterminismEngine.open(run, sessionId, mode, tapePath, baselineBuild, listener);
++            DeterminismEngine.open(run, sessionId, mode, tapePath, listener);
 +            context.newBodyInvoker()
-+                    .withContexts(new ReplaySessionHandle(sessionId, mode), new PassthroughSteps(passthrough))
++                    .withContexts(new ReplaySessionHandle(sessionId, mode))
 +                    .withCallback(new Callback(sessionId))
 +                    .start();
 +            return false;
@@ -1210,34 +1157,6 @@ index 0000000..12dfade
 +
 +    void save(@NonNull File file) throws IOException {
 +        DeterminismEngine.write(file, this);
-+    }
-+}
-diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/PassthroughSteps.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/PassthroughSteps.java
-new file mode 100644
-index 0000000..d7f479d
---- /dev/null
-+++ b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/PassthroughSteps.java
-@@ -0,0 +1,22 @@
-+package org.jenkinsci.plugins.workflow.cps.determinism;
-+
-+import java.io.Serializable;
-+import java.util.ArrayList;
-+import java.util.Collections;
-+import java.util.List;
-+
-+/** Context object listing step ids that are validated in VERIFY mode but executed live. */
-+public final class PassthroughSteps implements Serializable {
-+
-+    private static final long serialVersionUID = 1L;
-+
-+    private final ArrayList<String> stepIds;
-+
-+    PassthroughSteps(List<String> stepIds) {
-+        this.stepIds = new ArrayList<>(stepIds);
-+    }
-+
-+    public List<String> getStepIds() {
-+        return Collections.unmodifiableList(stepIds);
 +    }
 +}
 diff --git a/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ReplaySessionHandle.java b/plugin/src/main/java/org/jenkinsci/plugins/workflow/cps/determinism/ReplaySessionHandle.java
@@ -1459,10 +1378,10 @@ index 0000000..3816085
 +}
 diff --git a/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/config.jelly b/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/config.jelly
 new file mode 100644
-index 0000000..6fafd56
+index 0000000..2b5b90e
 --- /dev/null
 +++ b/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/config.jelly
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,9 @@
 +<?jelly escape-by-default='true'?>
 +<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
 +    <f:entry field="mode" title="Mode (record or verify)">
@@ -1470,9 +1389,6 @@ index 0000000..6fafd56
 +    </f:entry>
 +    <f:entry field="tapePath" title="Tape path (relative to the build directory)">
 +        <f:textbox/>
-+    </f:entry>
-+    <f:entry field="baselineBuild" title="Baseline build number (verify only)">
-+        <f:number/>
 +    </f:entry>
 +</j:jelly>
 diff --git a/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/help.html b/plugin/src/main/resources/org/jenkinsci/plugins/workflow/cps/determinism/DeterministicReplayStep/help.html
