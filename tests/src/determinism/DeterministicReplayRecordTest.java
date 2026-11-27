@@ -1,17 +1,22 @@
 package org.jenkinsci.plugins.workflow.cps.determinism;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.jenkinsci.plugins.workflow.cps.determinism.DeterminismTestSupport.RANDOM_SH;
 import static org.jenkinsci.plugins.workflow.cps.determinism.DeterminismTestSupport.define;
+import static org.jenkinsci.plugins.workflow.cps.determinism.DeterminismTestSupport.lines;
+import static org.jenkinsci.plugins.workflow.cps.determinism.DeterminismTestSupport.q;
 import static org.jenkinsci.plugins.workflow.cps.determinism.DeterminismTestSupport.tapeFile;
 
 import hudson.model.Result;
 import java.io.File;
+import java.util.List;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.jvnet.hudson.test.BuildWatcher;
 import org.jvnet.hudson.test.JenkinsRule;
 
@@ -22,6 +27,9 @@ public class DeterministicReplayRecordTest {
 
     @Rule
     public JenkinsRule r = new JenkinsRule();
+
+    @Rule
+    public TemporaryFolder tmp = new TemporaryFolder();
 
     @Test
     public void recordsOrderedTapeWithReturnValuesAndFailures() throws Exception {
@@ -75,6 +83,8 @@ public class DeterministicReplayRecordTest {
         WorkflowJob p = r.createProject(WorkflowJob.class, "p");
         define(p, "deterministicReplay(mode: 'record', tapePath: '../escape.xml') { echo 'x' }");
         r.assertLogContains("tapePath must be a relative path", r.buildAndAssertStatus(Result.FAILURE, p));
+        define(p, "deterministicReplay(mode: 'record', tapePath: '/tmp/abs.xml') { echo 'x' }");
+        r.assertLogContains("tapePath must be a relative path", r.buildAndAssertStatus(Result.FAILURE, p));
         define(p, "deterministicReplay(mode: 'replay', tapePath: 'x.xml') { echo 'x' }");
         r.assertLogContains("Unknown deterministicReplay mode", r.buildAndAssertStatus(Result.FAILURE, p));
         define(p, "deterministicReplay(mode: 'record', tapePath: 'a.xml') {\n"
@@ -85,11 +95,18 @@ public class DeterministicReplayRecordTest {
 
     @Test
     public void stepsOutsideTheBlockAreNotRecorded() throws Exception {
+        File marker = tmp.newFile("marker.log");
         WorkflowJob p = r.createProject(WorkflowJob.class, "p");
-        define(p, "echo 'outside-1'\n"
+        define(p, "node { echo 'before-A'; sh 'true'\n"
                 + "deterministicReplay(mode: 'record', tapePath: 't.xml') { echo 'inside' }\n"
-                + "echo 'outside-2'");
-        WorkflowRun b = r.buildAndAssertSuccess(p);
-        assertTrue(tapeFile(b, "t.xml").isFile());
+                + "echo 'after-A'; sh 'echo a' }");
+        r.buildAndAssertSuccess(p);
+        // Different steps before and after the block: a recorder that started early or kept
+        // capturing after the block would leave tape entries that this verify run never produces.
+        define(p, "node { echo 'before-B'\n"
+                + "deterministicReplay(mode: 'verify', tapePath: 't.xml') { echo 'inside' }\n"
+                + "sh \"echo after >> '" + q(marker) + "'\"; echo 'after-B' }");
+        r.buildAndAssertSuccess(p);
+        assertEquals("steps outside the block run normally", List.of("after"), lines(marker));
     }
 }

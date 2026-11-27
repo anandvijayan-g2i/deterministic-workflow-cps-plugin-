@@ -1,6 +1,5 @@
 PLUGIN_NAME ?= deterministic-workflow-cps-plugin
 IMAGE ?= $(PLUGIN_NAME):local
-IMAGE_TEST ?= $(PLUGIN_NAME)-test:local
 HARBOR ?= harbor
 
 CONTAINER_ENGINE ?= $(shell if command -v docker >/dev/null 2>&1; then echo docker; elif command -v podman >/dev/null 2>&1; then echo podman; else echo none; fi)
@@ -30,19 +29,16 @@ check-engine:
 build: check-engine
 	$(CONTAINER_ENGINE) build -t "$(IMAGE)" -f environment/Dockerfile environment
 
-build-test: check-engine
-	$(CONTAINER_ENGINE) build -t "$(IMAGE_TEST)" -f tests/Dockerfile tests
-
 run: build
 	$(CONTAINER_ENGINE) run --rm -v "$$PWD/solution:/solution:ro" "$(IMAGE)" /solution/solve.sh
 
-test: build-test
+test: build
 	@mkdir -p .make-logs/verifier
 	$(CONTAINER_ENGINE) run --rm \
 		-v "$$PWD/solution:/solution:ro" \
 		-v "$$PWD/tests:/tests:ro" \
 		-v "$$PWD/.make-logs/verifier:/logs/verifier" \
-		"$(IMAGE_TEST)" bash -c '/solution/solve.sh && /tests/test.sh'
+		"$(IMAGE)" bash -c '/solution/solve.sh && /tests/test.sh'
 
 package-golden-solution:
 	@command -v zip >/dev/null 2>&1 || { echo "zip is required to package the golden solution." >&2; exit 1; }
