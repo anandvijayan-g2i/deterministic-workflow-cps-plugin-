@@ -1,0 +1,40 @@
+name: test the task
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Golden solution + verifier
+    runs-on: ubuntu-latest
+    # Image build pre-fetches all Maven artifacts; the test run alone takes ~10 minutes.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run make test
+        run: make test CONTAINER_ENGINE=docker
+
+      - name: Show results
+        if: always()
+        run: |
+          cat .make-logs/verifier/results.txt 2>/dev/null || echo "no results.txt"
+          echo "reward=$(cat .make-logs/verifier/reward.txt 2>/dev/null || echo missing)"
+
+      - name: Upload verifier logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verifier-logs
+          path: .make-logs/verifier/
+          if-no-files-found: warn
